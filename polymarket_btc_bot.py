@@ -939,17 +939,17 @@ class TimingController:
 
 class OddsStream:
     """
-    Polymarket CLOB market channel — canlı odds delta.
+    Polymarket CLOB market channel — canlı odds delta + spread.
 
     Doğru endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
     Subscription:   {"assets_ids": [...], "type": "market",
                      "custom_feature_enabled": true}
 
-    price_change event yapısı:
+    price_change event:
         {"event_type": "price_change",
          "price_changes": [{"asset_id": "...", "price": "0.62", ...}]}
 
-    best_bid_ask event yapısı:
+    best_bid_ask event:
         {"event_type": "best_bid_ask", "asset_id": "...",
          "best_bid": "0.61", "best_ask": "0.63"}
     """
@@ -957,9 +957,10 @@ class OddsStream:
     WS_MARKET       = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     RECONNECT_DELAY = 1
 
-    def __init__(self, token_id: str, callback):
-        self.token_id    = token_id
-        self.callback    = callback
+    def __init__(self, token_id: str, callback, spread_callback=None):
+        self.token_id        = token_id
+        self.callback        = callback
+        self.spread_callback = spread_callback  # best_bid_ask için
         self._last_price: float | None = None
         self._running    = True
 
@@ -990,21 +991,34 @@ class OddsStream:
                         for event in events:
                             etype = event.get("event_type")
 
-                            # price_change: price_changes array içinde gelir
                             if etype == "price_change":
                                 for pc in event.get("price_changes", []):
                                     if pc.get("asset_id") == self.token_id:
                                         await self._handle_price(pc.get("price"))
+                                        # price_change içinde de best_bid/ask var
+                                        bid = pc.get("best_bid")
+                                        ask = pc.get("best_ask")
+                                        if bid and ask and self.spread_callback:
+                                            try:
+                                                self.spread_callback(
+                                                    float(bid), float(ask)
+                                                )
+                                            except ValueError:
+                                                pass
 
-                            # best_bid_ask: mid fiyat hesapla
                             elif etype == "best_bid_ask":
                                 if event.get("asset_id") == self.token_id:
                                     bid = event.get("best_bid")
                                     ask = event.get("best_ask")
                                     if bid and ask:
                                         try:
-                                            mid = (float(bid) + float(ask)) / 2
+                                            b, a = float(bid), float(ask)
+                                            # mid fiyat → odds callback
+                                            mid = (b + a) / 2
                                             await self._handle_price(str(mid))
+                                            # spread cache
+                                            if self.spread_callback:
+                                                self.spread_callback(b, a)
                                         except ValueError:
                                             pass
 
@@ -1410,7 +1424,11 @@ class DataHub:
                 if self._active_stream is not None:
                     self._active_stream.stop()
                     print("[OddsStream] Eski stream durduruldu.")
-                self._active_stream = OddsStream(token_id, self._make_odds_callback())
+                self._active_stream = OddsStream(
+                    token_id,
+                    self._make_odds_callback(),
+                    spread_callback=self.cache_spread,   # spread cache bağlantısı
+                )
                 self._active_token  = token_id
                 print(f"[OddsStream] Yeni stream: {token_id[:20]}...")
             try:
