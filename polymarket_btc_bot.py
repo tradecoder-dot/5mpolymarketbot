@@ -808,14 +808,29 @@ class BTC5mMarket:
                 data = await r.json()
             if not data:
                 return None
-            market    = data[0] if isinstance(data, list) else data
-            token_ids = market.get("clob_token_ids", [])
-            if not token_ids:
+            market = data[0] if isinstance(data, list) else data
+
+            # Gamma API hem camelCase hem snake_case döndürebilir
+            token_ids = (
+                market.get("clobTokenIds")       # camelCase (yeni format)
+                or market.get("clob_token_ids")  # snake_case (eski format)
+                or []
+            )
+            # String olarak gelebilir — parse et
+            if isinstance(token_ids, str):
+                import json as _json
+                try:
+                    token_ids = _json.loads(token_ids)
+                except Exception:
+                    token_ids = []
+
+            if not token_ids or not token_ids[0]:
                 return None
+
             return {
                 "slug":          slug,
-                "up_token_id":   token_ids[0],
-                "down_token_id": token_ids[1] if len(token_ids) > 1 else None,
+                "up_token_id":   str(token_ids[0]),
+                "down_token_id": str(token_ids[1]) if len(token_ids) > 1 else None,
                 "question":      market.get("question", slug),
             }
         except Exception:
@@ -828,6 +843,7 @@ class BTC5mMarket:
         """
         try:
             session = await SessionManager.get()
+            # events endpoint'i slug ile sorgulanıyor
             async with session.get(
                 f"{GAMMA_HOST}/events",
                 params={"slug": slug},
@@ -842,15 +858,28 @@ class BTC5mMarket:
             markets = event.get("markets", [])
             if not markets:
                 return None
-            # İlk aktif market'i bul
-            market    = markets[0]
-            token_ids = market.get("clobTokenIds", market.get("clob_token_ids", []))
-            if not token_ids:
+
+            market = markets[0]
+            # camelCase ve snake_case her ikisini dene
+            token_ids = (
+                market.get("clobTokenIds")
+                or market.get("clob_token_ids")
+                or []
+            )
+            if isinstance(token_ids, str):
+                import json as _json
+                try:
+                    token_ids = _json.loads(token_ids)
+                except Exception:
+                    token_ids = []
+
+            if not token_ids or not token_ids[0]:
                 return None
+
             return {
                 "slug":          slug,
-                "up_token_id":   token_ids[0],
-                "down_token_id": token_ids[1] if len(token_ids) > 1 else None,
+                "up_token_id":   str(token_ids[0]),
+                "down_token_id": str(token_ids[1]) if len(token_ids) > 1 else None,
                 "question":      market.get("question", event.get("title", slug)),
             }
         except Exception:
@@ -1265,14 +1294,22 @@ class DataHub:
             if not ids or not ids.get("up_token_id"):
                 await asyncio.sleep(2)
                 continue
+
             token_id = ids["up_token_id"]
+
+            # Token ID geçerli mi? Boş string veya köşeli parantez değil
+            if not token_id or len(token_id) < 10:
+                print(f"[OddsStream] Geçersiz token ID: '{token_id}', bekleniyor...")
+                await asyncio.sleep(5)
+                continue
+
             if self._active_token != token_id:
                 if self._active_stream is not None:
                     self._active_stream.stop()
                     print("[OddsStream] Eski stream durduruldu.")
                 self._active_stream = OddsStream(token_id, self._make_odds_callback())
                 self._active_token  = token_id
-                print(f"[OddsStream] Yeni stream: {token_id}")
+                print(f"[OddsStream] Yeni stream: {token_id[:20]}...")
             try:
                 await self._active_stream.run()
             except Exception as e:
