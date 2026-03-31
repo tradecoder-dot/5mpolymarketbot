@@ -1291,30 +1291,9 @@ class PriceReader:
 
     async def get_spread(self, token_id: str) -> dict:
         """
-        Spread için önce /spread endpoint'i dene,
-        başarısız olursa /book endpoint'inden hesapla.
+        Orderbook'tan best bid/ask hesapla.
+        /spread endpoint yerine /book kullanıyoruz — daha güvenilir.
         """
-        # Yol 1: /spread endpoint
-        try:
-            session = await SessionManager.get()
-            async with session.get(
-                f"{CLOB_HOST}/spread",
-                params={"token_id": token_id},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as r:
-                data = await r.json()
-
-            bid    = float(data.get("bid",  0) or 0)
-            ask    = float(data.get("ask",  1) or 1)
-            spread = max(ask - bid, 0.0)
-
-            # Spread 0.5+ ise endpoint hatalı dönmüş olabilir — book'a geç
-            if spread < 0.5:
-                return {"bid": bid, "ask": ask, "spread": spread}
-        except Exception as e:
-            print(f"[PriceReader] spread endpoint hata: {e} — book'a geçiliyor")
-
-        # Yol 2: /book endpoint'inden best bid/ask al
         try:
             session = await SessionManager.get()
             async with session.get(
@@ -1327,16 +1306,17 @@ class PriceReader:
             bids = data.get("bids", [])
             asks = data.get("asks", [])
 
+            # Bids yüksekten düşüğe, asks düşükten yükseğe sıralı
             best_bid = float(bids[0]["price"]) if bids else 0.0
             best_ask = float(asks[0]["price"]) if asks else 1.0
             spread   = max(best_ask - best_bid, 0.0)
 
+            print(f"[PriceReader] book OK → bid={best_bid:.3f} ask={best_ask:.3f} spread={spread:.3f}")
             return {"bid": best_bid, "ask": best_ask, "spread": spread}
-        except Exception as e:
-            print(f"[PriceReader] book endpoint hata: {e} — default döndürülüyor")
 
-        # Her iki yol da başarısız
-        return {"bid": 0.0, "ask": 1.0, "spread": 1.0}
+        except Exception as e:
+            print(f"[PriceReader] book hata: {e}")
+            return {"bid": 0.0, "ask": 1.0, "spread": 1.0}
 
 
 # ══════════════════════════════════════════════════════════════
