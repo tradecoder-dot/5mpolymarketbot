@@ -954,13 +954,14 @@ class OddsStream:
          "best_bid": "0.61", "best_ask": "0.63"}
     """
 
-    WS_MARKET       = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    RECONNECT_DELAY = 1
+    WS_MARKET          = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    HEARTBEAT_INTERVAL = 10   # Polymarket: her 10s PING gönder
+    RECONNECT_DELAY    = 1    # Kopunca kaç saniye bekle
 
     def __init__(self, token_id: str, callback, spread_callback=None):
         self.token_id        = token_id
         self.callback        = callback
-        self.spread_callback = spread_callback  # best_bid_ask için
+        self.spread_callback = spread_callback
         self._last_price: float | None = None
         self._running    = True
 
@@ -971,7 +972,9 @@ class OddsStream:
         while self._running:
             try:
                 async with websockets.connect(
-                    self.WS_MARKET, ping_interval=20, ping_timeout=10,
+                    self.WS_MARKET,
+                    ping_interval=None,   # Manuel ping kullanıyoruz
+                    ping_timeout=None,
                 ) as ws:
                     await ws.send(json.dumps({
                         "assets_ids":             [self.token_id],
@@ -979,9 +982,17 @@ class OddsStream:
                         "custom_feature_enabled": True,
                     }))
 
+                    last_ping = time.time()
+
                     async for raw in ws:
                         if not self._running:
                             return
+
+                        # Heartbeat — her 10s PING gönder
+                        if time.time() - last_ping >= self.HEARTBEAT_INTERVAL:
+                            await ws.send("PING")
+                            last_ping = time.time()
+
                         try:
                             msg = json.loads(raw)
                         except json.JSONDecodeError:
@@ -995,7 +1006,6 @@ class OddsStream:
                                 for pc in event.get("price_changes", []):
                                     if pc.get("asset_id") == self.token_id:
                                         await self._handle_price(pc.get("price"))
-                                        # price_change içinde de best_bid/ask var
                                         bid = pc.get("best_bid")
                                         ask = pc.get("best_ask")
                                         if bid and ask and self.spread_callback:
@@ -1013,10 +1023,8 @@ class OddsStream:
                                     if bid and ask:
                                         try:
                                             b, a = float(bid), float(ask)
-                                            # mid fiyat → odds callback
                                             mid = (b + a) / 2
                                             await self._handle_price(str(mid))
-                                            # spread cache
                                             if self.spread_callback:
                                                 self.spread_callback(b, a)
                                         except ValueError:
@@ -1292,31 +1300,44 @@ class PriceReader:
     async def get_spread(self, token_id: str) -> dict:
         """
         Orderbook'tan best bid/ask hesapla.
-        /spread endpoint yerine /book kullanıyoruz — daha güvenilir.
+        token_id ve asset_id her ikisini dene.
         """
-        try:
-            session = await SessionManager.get()
-            async with session.get(
-                f"{CLOB_HOST}/book",
-                params={"token_id": token_id},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as r:
-                data = await r.json()
+        for param_name in ("token_id", "asset_id"):
+            try:
+                session = await SessionManager.get()
+                async with session.get(
+                    f"{CLOB_HOST}/book",
+                    params={param_name: token_id},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as r:
+                    text = await r.text()
+                    try:
+                        data = __import__('json').loads(text)
+                    except Exception:
+                        print(f"[PriceReader] book JSON parse hata "
+                              f"({param_name}): {text[:100]}")
+                        continue
 
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
 
-            # Bids yüksekten düşüğe, asks düşükten yükseğe sıralı
-            best_bid = float(bids[0]["price"]) if bids else 0.0
-            best_ask = float(asks[0]["price"]) if asks else 1.0
-            spread   = max(best_ask - best_bid, 0.0)
+                if not bids and not asks:
+                    print(f"[PriceReader] book boş ({param_name}): {data}")
+                    continue
 
-            print(f"[PriceReader] book OK → bid={best_bid:.3f} ask={best_ask:.3f} spread={spread:.3f}")
-            return {"bid": best_bid, "ask": best_ask, "spread": spread}
+                best_bid = float(bids[0]["price"]) if bids else 0.0
+                best_ask = float(asks[0]["price"]) if asks else 1.0
+                spread   = max(best_ask - best_bid, 0.0)
 
-        except Exception as e:
-            print(f"[PriceReader] book hata: {e}")
-            return {"bid": 0.0, "ask": 1.0, "spread": 1.0}
+                print(f"[PriceReader] book OK ({param_name}) → "
+                      f"bid={best_bid:.3f} ask={best_ask:.3f} spread={spread:.3f}")
+                return {"bid": best_bid, "ask": best_ask, "spread": spread}
+
+            except Exception as e:
+                print(f"[PriceReader] book hata ({param_name}): {e}")
+
+        print("[PriceReader] Tüm yollar başarısız — spread=1.0 döndürülüyor")
+        return {"bid": 0.0, "ask": 1.0, "spread": 1.0}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1362,7 +1383,9 @@ class DataHub:
             if ids["up_token_id"]:
                 mid = await self.price_reader.get_midpoint(ids["up_token_id"])
                 self._p_market[0] = mid
-            # Yeni pencere açıldı — Chainlink fiyatını window_open_price olarak kilitle
+            # Yeni pencere açıldı — eski spread cache'i sıfırla
+            self._cached_spread = None
+            # Chainlink fiyatını window_open_price olarak kilitle
             self.price_feed.set_window_open()
         return ids
 
@@ -1378,9 +1401,12 @@ class DataHub:
         return on_odds
 
     def cache_spread(self, bid: float, ask: float):
-        """OddsStream'den gelen best_bid_ask event'ini cache'ler."""
+        """OddsStream'den gelen best_bid_ask event'ini cache'ler.
+        OddsStream kopsa bile son bilinen değer korunur."""
         spread = max(ask - bid, 0.0)
-        self._cached_spread = {"bid": bid, "ask": ask, "spread": spread}
+        # Sadece geçerli spread değerlerini cache'le (1.0 değil)
+        if spread < 0.5:
+            self._cached_spread = {"bid": bid, "ask": ask, "spread": spread}
 
     def get_cached_spread(self) -> dict | None:
         return self._cached_spread
