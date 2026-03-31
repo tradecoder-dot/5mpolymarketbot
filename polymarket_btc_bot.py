@@ -747,6 +747,19 @@ class ResolveFetcher:
 # ══════════════════════════════════════════════════════════════
 
 class BTC5mMarket:
+    """
+    Deterministik slug hesaplama + çoklu timestamp denemesi.
+
+    Sorun: local saat ile Polymarket server saati arasında birkaç saniyelik
+    fark olabilir. Bu fark pencere başında yanlış slug üretmesine yol açar.
+
+    Çözüm:
+        1. Mevcut pencere slug'ını dene
+        2. Bir önceki pencere slug'ını dene (geçiş anında faydalı)
+        3. events endpoint'ini dene (markets'a alternatif)
+        Her adımda token ID bulunursa hemen döner.
+    """
+
     def get_current_window(self) -> dict:
         now       = int(time.time())
         window_ts = now - (now % 300)
@@ -767,7 +780,22 @@ class BTC5mMarket:
             "close_time": window_ts + 300,
         }
 
-    async def fetch_token_ids(self, slug: str) -> dict | None:
+    def _candidate_slugs(self) -> list[str]:
+        """
+        Server/client saat farkını tolere etmek için
+        birden fazla pencere timestamp'i dener.
+        Sıra: mevcut → önceki → sonraki pencere
+        """
+        now       = int(time.time())
+        window_ts = now - (now % 300)
+        return [
+            f"btc-updown-5m-{window_ts}",         # mevcut pencere
+            f"btc-updown-5m-{window_ts - 300}",   # bir önceki
+            f"btc-updown-5m-{window_ts + 300}",   # bir sonraki
+        ]
+
+    async def _fetch_via_markets(self, slug: str) -> dict | None:
+        """gamma-api/markets endpoint'i ile token ID çek."""
         try:
             session = await SessionManager.get()
             async with session.get(
@@ -775,13 +803,14 @@ class BTC5mMarket:
                 params={"slug": slug},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as r:
+                if r.status != 200:
+                    return None
                 data = await r.json()
             if not data:
                 return None
             market    = data[0] if isinstance(data, list) else data
             token_ids = market.get("clob_token_ids", [])
             if not token_ids:
-                print(f"[Market] {slug} için token ID bulunamadı.")
                 return None
             return {
                 "slug":          slug,
@@ -789,9 +818,70 @@ class BTC5mMarket:
                 "down_token_id": token_ids[1] if len(token_ids) > 1 else None,
                 "question":      market.get("question", slug),
             }
-        except Exception as e:
-            print(f"[Market] fetch_token_ids hata: {e}")
+        except Exception:
             return None
+
+    async def _fetch_via_events(self, slug: str) -> dict | None:
+        """
+        gamma-api/events endpoint'i ile token ID çek.
+        markets endpoint başarısız olunca yedek yol.
+        """
+        try:
+            session = await SessionManager.get()
+            async with session.get(
+                f"{GAMMA_HOST}/events",
+                params={"slug": slug},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+            if not data:
+                return None
+            event   = data[0] if isinstance(data, list) else data
+            markets = event.get("markets", [])
+            if not markets:
+                return None
+            # İlk aktif market'i bul
+            market    = markets[0]
+            token_ids = market.get("clobTokenIds", market.get("clob_token_ids", []))
+            if not token_ids:
+                return None
+            return {
+                "slug":          slug,
+                "up_token_id":   token_ids[0],
+                "down_token_id": token_ids[1] if len(token_ids) > 1 else None,
+                "question":      market.get("question", event.get("title", slug)),
+            }
+        except Exception:
+            return None
+
+    async def fetch_token_ids(self, slug: str | None = None) -> dict | None:
+        """
+        Token ID'leri çek.
+        slug verilmezse mevcut pencereyi otomatik hesaplar.
+        Birden fazla slug + iki endpoint dener — ilk başarılıda döner.
+        """
+        candidates = self._candidate_slugs() if slug is None else [slug]
+
+        for try_slug in candidates:
+            # Yol 1: markets endpoint
+            result = await self._fetch_via_markets(try_slug)
+            if result:
+                if try_slug != candidates[0]:
+                    print(f"[Market] Alternatif slug bulundu: {try_slug}")
+                return result
+
+            # Yol 2: events endpoint
+            result = await self._fetch_via_events(try_slug)
+            if result:
+                if try_slug != candidates[0]:
+                    print(f"[Market] Events endpoint ile bulundu: {try_slug}")
+                return result
+
+        print(f"[Market] Token ID bulunamadı "
+              f"({len(candidates)} slug denendi: {candidates[0]} ...)")
+        return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1145,7 +1235,9 @@ class DataHub:
 
     async def _refresh_market(self):
         window = self.market.get_current_window()
-        ids    = await self.market.fetch_token_ids(window["slug"])
+        # slug parametresi geçmiyoruz — fetch_token_ids kendi içinde
+        # birden fazla candidate slug deniyor (saat farkı toleransı)
+        ids = await self.market.fetch_token_ids()
         if ids:
             self._token_ids = ids
             print(f"[Market] {ids['question']}")
