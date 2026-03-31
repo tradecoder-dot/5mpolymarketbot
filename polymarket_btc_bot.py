@@ -938,6 +938,23 @@ class TimingController:
 # ══════════════════════════════════════════════════════════════
 
 class OddsStream:
+    """
+    Polymarket CLOB market channel — canlı odds delta.
+
+    Doğru endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
+    Subscription:   {"assets_ids": [...], "type": "market",
+                     "custom_feature_enabled": true}
+
+    price_change event yapısı:
+        {"event_type": "price_change",
+         "price_changes": [{"asset_id": "...", "price": "0.62", ...}]}
+
+    best_bid_ask event yapısı:
+        {"event_type": "best_bid_ask", "asset_id": "...",
+         "best_bid": "0.61", "best_ask": "0.63"}
+    """
+
+    WS_MARKET       = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     RECONNECT_DELAY = 1
 
     def __init__(self, token_id: str, callback):
@@ -953,22 +970,44 @@ class OddsStream:
         while self._running:
             try:
                 async with websockets.connect(
-                    WS_CLOB, ping_interval=20, ping_timeout=10,
+                    self.WS_MARKET, ping_interval=20, ping_timeout=10,
                 ) as ws:
                     await ws.send(json.dumps({
-                        "auth": {}, "markets": [self.token_id], "type": "market",
+                        "assets_ids":             [self.token_id],
+                        "type":                   "market",
+                        "custom_feature_enabled": True,
                     }))
+
                     async for raw in ws:
                         if not self._running:
                             return
-                        msg    = json.loads(raw)
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+
                         events = msg if isinstance(msg, list) else [msg]
                         for event in events:
-                            if event.get("event_type") == "price_change":
-                                new_price = float(event.get("price", 0))
-                                if self._last_price is not None:
-                                    await self.callback(new_price - self._last_price)
-                                self._last_price = new_price
+                            etype = event.get("event_type")
+
+                            # price_change: price_changes array içinde gelir
+                            if etype == "price_change":
+                                for pc in event.get("price_changes", []):
+                                    if pc.get("asset_id") == self.token_id:
+                                        await self._handle_price(pc.get("price"))
+
+                            # best_bid_ask: mid fiyat hesapla
+                            elif etype == "best_bid_ask":
+                                if event.get("asset_id") == self.token_id:
+                                    bid = event.get("best_bid")
+                                    ask = event.get("best_ask")
+                                    if bid and ask:
+                                        try:
+                                            mid = (float(bid) + float(ask)) / 2
+                                            await self._handle_price(str(mid))
+                                        except ValueError:
+                                            pass
+
             except websockets.ConnectionClosed:
                 if self._running:
                     print(f"[OddsStream] Koptu, {self.RECONNECT_DELAY}s sonra yeniden...")
@@ -977,6 +1016,20 @@ class OddsStream:
                 if self._running:
                     print(f"[OddsStream] Hata: {e}")
                     await asyncio.sleep(self.RECONNECT_DELAY)
+
+    async def _handle_price(self, price_str: str | None):
+        if not price_str:
+            return
+        try:
+            new_price = float(price_str)
+            if new_price <= 0:
+                return
+            if self._last_price is not None:
+                delta = new_price - self._last_price
+                await self.callback(delta)
+            self._last_price = new_price
+        except ValueError:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
