@@ -1264,27 +1264,65 @@ class PriceReader:
         try:
             session = await SessionManager.get()
             async with session.get(
-                f"{CLOB_HOST}/midpoint", params={"token_id": token_id},
-                timeout=aiohttp.ClientTimeout(total=3),
+                f"{CLOB_HOST}/midpoint",
+                params={"token_id": token_id},
+                timeout=aiohttp.ClientTimeout(total=5),
             ) as r:
                 data = await r.json()
-            return float(np.clip(float(data.get("mid", 0.5)), 0.01, 0.99))
-        except Exception:
+            mid = data.get("mid") or data.get("price") or 0.5
+            return float(np.clip(float(mid), 0.01, 0.99))
+        except Exception as e:
+            print(f"[PriceReader] midpoint hata: {e}")
             return 0.5
 
     async def get_spread(self, token_id: str) -> dict:
+        """
+        Spread için önce /spread endpoint'i dene,
+        başarısız olursa /book endpoint'inden hesapla.
+        """
+        # Yol 1: /spread endpoint
         try:
             session = await SessionManager.get()
             async with session.get(
-                f"{CLOB_HOST}/spread", params={"token_id": token_id},
-                timeout=aiohttp.ClientTimeout(total=3),
+                f"{CLOB_HOST}/spread",
+                params={"token_id": token_id},
+                timeout=aiohttp.ClientTimeout(total=5),
             ) as r:
                 data = await r.json()
-            bid    = float(data.get("bid", 0))
-            ask    = float(data.get("ask", 1))
-            return {"bid": bid, "ask": ask, "spread": max(ask - bid, 0.0)}
-        except Exception:
-            return {"bid": 0.0, "ask": 1.0, "spread": 1.0}
+
+            bid    = float(data.get("bid",  0) or 0)
+            ask    = float(data.get("ask",  1) or 1)
+            spread = max(ask - bid, 0.0)
+
+            # Spread 0.5+ ise endpoint hatalı dönmüş olabilir — book'a geç
+            if spread < 0.5:
+                return {"bid": bid, "ask": ask, "spread": spread}
+        except Exception as e:
+            print(f"[PriceReader] spread endpoint hata: {e} — book'a geçiliyor")
+
+        # Yol 2: /book endpoint'inden best bid/ask al
+        try:
+            session = await SessionManager.get()
+            async with session.get(
+                f"{CLOB_HOST}/book",
+                params={"token_id": token_id},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as r:
+                data = await r.json()
+
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+
+            best_bid = float(bids[0]["price"]) if bids else 0.0
+            best_ask = float(asks[0]["price"]) if asks else 1.0
+            spread   = max(best_ask - best_bid, 0.0)
+
+            return {"bid": best_bid, "ask": best_ask, "spread": spread}
+        except Exception as e:
+            print(f"[PriceReader] book endpoint hata: {e} — default döndürülüyor")
+
+        # Her iki yol da başarısız
+        return {"bid": 0.0, "ask": 1.0, "spread": 1.0}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1315,6 +1353,9 @@ class DataHub:
         self._active_stream: OddsStream | None = None
         self._active_token:  str | None = None
 
+        # best_bid_ask event'inden gelen son spread — REST çağrısını azaltır
+        self._cached_spread: dict | None = None
+
     async def _refresh_market(self):
         window = self.market.get_current_window()
         # slug parametresi geçmiyoruz — fetch_token_ids kendi içinde
@@ -1332,14 +1373,23 @@ class DataHub:
         return ids
 
     def _make_odds_callback(self):
-        odds_ref = self._odds_delta
-        p_ref    = self._p_market
+        odds_ref     = self._odds_delta
+        p_ref        = self._p_market
+        spread_cache = self  # DataHub referansı
 
         async def on_odds(delta: float):
             odds_ref[0] = delta
             p_ref[0]    = max(0.01, min(0.99, p_ref[0] + delta))
 
         return on_odds
+
+    def cache_spread(self, bid: float, ask: float):
+        """OddsStream'den gelen best_bid_ask event'ini cache'ler."""
+        spread = max(ask - bid, 0.0)
+        self._cached_spread = {"bid": bid, "ask": ask, "spread": spread}
+
+    def get_cached_spread(self) -> dict | None:
+        return self._cached_spread
 
     async def _odds_stream_loop(self):
         while True:
@@ -1485,7 +1535,11 @@ class Bot:
                 await asyncio.sleep(max(close_time - time.time(), 0) + 2)
                 continue
 
-            spread   = await self.price_reader.get_spread(ids["up_token_id"])
+            # Spread: önce WS cache'ten al (hızlı), yoksa REST çağrısı yap
+            spread = (
+                self.hub.get_cached_spread()
+                or await self.price_reader.get_spread(ids["up_token_id"])
+            )
             decision = self.engine.evaluate(
                 market_id=ids["up_token_id"],
                 state=state,
