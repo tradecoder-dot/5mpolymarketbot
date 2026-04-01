@@ -433,40 +433,39 @@ class LimitPricer:
     Mantık:
         UP  tarafı → bid + actual_offset
         DOWN tarafı → ask − actual_offset
-
         actual_offset = min(offset, spread×0.5, max_offset)
-        → dar spread'de agresif limit koymayız
 
     Paper-trade fill simülasyonu:
         entry ≥ ask  → her zaman dolar (taker)
-        entry <  ask → fill_prob = clip(1 − distance×20, 0.10, 0.95)
+        entry <  ask → fill_prob = clip(1 − distance×10, 0.20, 0.95)
+        (20→10: spread tahmini belirsizken daha geniş fill penceresi)
 
     Kalibre edilecek katsayılar:
-        offset     : 0.01
-        max_offset : 0.03
+        offset     : 0.005  (0.01→0.005: daha agresif limit)
+        max_offset : 0.02
+        fill_mult  : 10     (20→10: daha fazla fill)
     """
 
     def __init__(
         self,
-        offset:     float = 0.01,   # kalibre edilecek
-        max_offset: float = 0.03,   # kalibre edilecek
+        offset:     float = 0.005,   # kalibre edilecek
+        max_offset: float = 0.02,    # kalibre edilecek
+        fill_mult:  float = 10.0,    # kalibre edilecek
     ):
         self.offset     = offset
         self.max_offset = max_offset
+        self.fill_mult  = fill_mult
 
     def get_limit_price(self, side: str, spread: dict) -> float:
-        actual_offset = min(
-            self.offset,
-            spread["spread"] * 0.5,
-            self.max_offset,
-        )
+        # Spread yoksa midpoint tahmin et
+        bid = spread.get("bid") or 0.0
+        ask = spread.get("ask") or 1.0
+        sp  = spread.get("spread") or (ask - bid)
+
+        actual_offset = min(self.offset, sp * 0.5, self.max_offset)
         actual_offset = max(actual_offset, 0.0)
 
-        if side == "up":
-            price = spread["bid"] + actual_offset
-        else:
-            price = spread["ask"] - actual_offset
-
+        price = (bid + actual_offset) if side == "up" else (ask - actual_offset)
         return float(np.clip(price, 0.01, 0.99))
 
     def simulate_fill(
@@ -475,11 +474,11 @@ class LimitPricer:
         spread:      dict,
         rng:         np.random.Generator | None = None,
     ) -> bool:
-        ask = spread["ask"]
+        ask = spread.get("ask") or 1.0
         if entry_price >= ask:
             return True
         distance  = ask - entry_price
-        fill_prob = float(np.clip(1.0 - distance * 20, 0.10, 0.95))
+        fill_prob = float(np.clip(1.0 - distance * self.fill_mult, 0.20, 0.95))
         r = rng if rng is not None else np.random.default_rng()
         return bool(r.random() < fill_prob)
 
@@ -490,17 +489,24 @@ class LimitPricer:
 
 def _compute_ev_fields(
     p_true: float, p_market: float, position_usdc: float,
+    side: str = "up",
 ) -> dict:
     """
-    EV formülleri:
-        ev_per_contract = p_true − p_market
-        roi_pct         = (ev / p_market) × 100
-        expected_profit = position_usdc × (ev / p_market)
+    EV formülleri — yöne göre doğru hesap:
+
+    UP token:  ev = p_true - p_market,       token_price = p_market
+    DOWN token: ev = p_market - p_true,      token_price = 1 - p_market
     """
-    ev  = p_true - p_market
-    pm  = max(p_market, 1e-8)
-    roi = (ev / pm) * 100
-    exp = position_usdc * (ev / pm)
+    if side == "up":
+        ev          = p_true - p_market
+        token_price = p_market
+    else:
+        ev          = p_market - p_true       # DOWN doğru formül
+        token_price = 1.0 - p_market          # DOWN token fiyatı
+
+    tp  = max(token_price, 1e-8)
+    roi = (ev / tp) * 100
+    exp = position_usdc * (ev / tp)
     return {
         "ev_per_contract": round(ev,  4),
         "roi_pct":         round(roi, 2),
@@ -520,10 +526,11 @@ class DecisionEngine:
 
     def evaluate(
         self,
-        market_id: str,
-        state:     MarketState,
-        capital:   float,
-        direction: int = 1,
+        market_id:   str,
+        state:       MarketState,
+        capital:     float,
+        direction:   int = 1,
+        odds_source: str = "rtds",   # "rtds" | "rest" | "none"
     ) -> dict:
         p_true = self.updater.update(state, direction)
 
@@ -531,27 +538,34 @@ class DecisionEngine:
             return {"action": "hold", "reason": "açık pozisyon var",
                     "p_true": p_true, "p_market": state.p_market}
 
-        # EK-3: KellySizer artık (result, side) tuple döndürüyor
+        # Odds kaynağına göre dinamik min_edge
+        original_min_edge = self.sizer.min_edge
+        if odds_source == "rest":
+            self.sizer.min_edge = max(original_min_edge, 0.06)
+        elif odds_source == "none":
+            self.sizer.min_edge = max(original_min_edge, 0.08)
+
         outcome = self.sizer.compute(p_true, state.p_market, capital)
+        self.sizer.min_edge = original_min_edge   # her zaman geri al
+
         if outcome is None:
             return {"action": "hold", "reason": "edge yetersiz",
                     "p_true": p_true, "p_market": state.p_market}
 
         result, side = outcome
-
-        # EK-2: EV alanları
-        ev_fields = _compute_ev_fields(p_true, state.p_market, result.position_usdc)
+        ev_fields = _compute_ev_fields(p_true, state.p_market, result.position_usdc, side=side)
 
         return {
-            "action":    "open_long" if side == "up" else "open_short",
-            "side":      side,
-            "market_id": market_id,
-            "usdc":      result.position_usdc,
-            "p_true":    p_true,
-            "p_market":  state.p_market,
-            "edge":      result.edge,
-            "f_kelly":   result.f_fractional,
-            **ev_fields,   # ev_per_contract, roi_pct, expected_profit
+            "action":      "open_long" if side == "up" else "open_short",
+            "side":        side,
+            "market_id":   market_id,
+            "usdc":        result.position_usdc,
+            "p_true":      p_true,
+            "p_market":    state.p_market,
+            "edge":        result.edge,
+            "f_kelly":     result.f_fractional,
+            "odds_source": odds_source,
+            **ev_fields,
         }
 
     def register_open(self, market_id: str):
@@ -1020,181 +1034,154 @@ class TimingController:
 # ODDS STREAM  (FIX-2, FIX-8)
 # ══════════════════════════════════════════════════════════════
 
-class OddsStream:
+class OddsHub:
     """
-    Polymarket CLOB market channel — canlı odds delta + spread.
+    RTDS primary + REST fallback — çift kaynaklı odds sistemi.
 
-    Doğru endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
-    Subscription:   {"assets_ids": [...], "type": "market",
-                     "custom_feature_enabled": true}
+    PRIMARY — RTDS Chainlink fiyat değişimi:
+        Polymarket RTDS'ten gelen Chainlink tick'leri zaten açık.
+        BTC fiyatının hızı ve yönü = piyasanın odds yönüyle yüksek korelasyon.
+        Fiyat hızla yükseliyorsa UP token pahalılaşır → odds_delta pozitif.
+        Bu sinyal milisaniye hassasiyetinde, WS bağlantısı RTDS'e bağlı.
 
-    price_change event:
-        {"event_type": "price_change",
-         "price_changes": [{"asset_id": "...", "price": "0.62", ...}]}
+    FALLBACK — REST /midpoint polling:
+        CLOB WS'in "silent freeze" ve kopma sorununa karşı.
+        Her POLL_INTERVAL saniyede bir CLOB /midpoint sorgulanır.
+        RTDS'ten son X saniyedir güncelleme gelmemişse devreye girer.
+        Spread de aynı döngüde /spread endpoint'inden alınır.
 
-    best_bid_ask event:
-        {"event_type": "best_bid_ask", "asset_id": "...",
-         "best_bid": "0.61", "best_ask": "0.63"}
+    Geçiş mantığı:
+        rtds_last_update > RTDS_TIMEOUT → REST fallback aktif
+        Aksi halde RTDS primary kullanılır
+
+    Kalibre edilecek:
+        POLL_INTERVAL  : 10s
+        RTDS_TIMEOUT   : 15s  (bu kadar Chainlink yoksa REST'e geç)
     """
 
-    WS_MARKET          = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-    HEARTBEAT_INTERVAL = 10   # Polymarket: her 10s PING gönder
-    RECONNECT_DELAY    = 1    # Kopunca kaç saniye bekle
+    POLL_INTERVAL = 10    # REST fallback polling aralığı (saniye)
+    RTDS_TIMEOUT  = 15    # RTDS bu kadar sessiz kalırsa REST devreye girer
 
-    def __init__(self, token_id: str, callback, spread_callback=None):
-        self.token_id        = token_id
-        self.callback        = callback
-        self.spread_callback = spread_callback
-        self._last_price: float | None = None
-        self._running        = True
-        self._pending_token: str | None = None   # dynamic subscribe için
+    def __init__(self):
+        self._last_mid:         float | None = None
+        self._last_rtds_price:  float | None = None
+        self._last_rtds_ts:     float        = 0.0
+        self._running  = True
+        self._source   = "none"   # "rtds" | "rest" | "none"
 
     def stop(self):
         self._running = False
 
-    def update_token(self, new_token_id: str):
-        """
-        Pencere geçişinde WS'i kesmeden yeni token'a abone ol.
-        Polymarket dynamic subscribe destekliyor:
-        {"assets_ids": ["new_id"], "operation": "subscribe"}
-        {"assets_ids": ["old_id"], "operation": "unsubscribe"}
-        """
-        self._pending_token = new_token_id
+    def reset(self):
+        """Yeni pencere başlayınca delta sıfırla."""
+        self._last_mid        = None
+        self._last_rtds_price = None
+        self._last_rtds_ts    = 0.0
 
-    async def run(self):
+    @property
+    def active_source(self) -> str:
+        return self._source
+
+    def on_rtds_price(
+        self,
+        chainlink_price: float,
+        odds_ref: list,
+        p_ref:    list,
+    ) -> None:
+        """
+        PriceFeed'den her Chainlink tick'inde çağrılır.
+        Fiyat değişim hızını odds_delta proxy'si olarak kullanır.
+        """
+        now = time.time()
+        if self._last_rtds_price is not None:
+            # Fiyat değişimi oranı → odds delta proxy
+            # BTC +%0.1 → UP token ~+0.02 (ampirik katsayı 0.2)
+            pct_change = (chainlink_price - self._last_rtds_price) / self._last_rtds_price
+            delta = float(np.clip(pct_change * 0.2, -0.05, 0.05))
+            if abs(delta) > 0.0001:   # ~%0.05 BTC hareketi eşiği
+                odds_ref[0] = delta
+                p_ref[0]    = float(np.clip(p_ref[0] + delta, 0.01, 0.99))
+                self._source = "rtds"
+
+        self._last_rtds_price = chainlink_price
+        self._last_rtds_ts    = now
+
+    def _rtds_is_fresh(self) -> bool:
+        return (time.time() - self._last_rtds_ts) < self.RTDS_TIMEOUT
+
+    async def run(
+        self,
+        get_token_id,      # callable → str | None
+        odds_ref: list,
+        p_ref:    list,
+        spread_cache_fn,   # callable(bid, ask)
+    ):
+        """REST fallback döngüsü — RTDS sessizse devreye girer."""
+        print("[OddsHub] Başladı (RTDS primary + REST fallback)")
+
         while self._running:
+            await asyncio.sleep(self.POLL_INTERVAL)
+
+            if not self._running:
+                break
+
             try:
-                async with websockets.connect(
-                    self.WS_MARKET,
-                    ping_interval=None,
-                    ping_timeout=None,
-                ) as ws:
-                    await ws.send(json.dumps({
-                        "assets_ids":             [self.token_id],
-                        "type":                   "market",
-                        "custom_feature_enabled": True,
-                    }))
+                token_id = get_token_id()
+                if not token_id or len(token_id) < 10:
+                    continue
 
-                    # Ping'i bağımsız task olarak çalıştır
-                    # async for raw in ws blokelenince ping gönderilemez sorununu çözer
-                    ping_task = asyncio.create_task(self._ping_loop(ws))
+                # RTDS taze veri veriyorsa REST'e gerek yok
+                # Sadece spread almak için yine de sorgula
+                session = await SessionManager.get()
 
-                    try:
-                        async for raw in ws:
-                            if not self._running:
-                                return
+                # Midpoint — RTDS sessizse p_market güncelle
+                if not self._rtds_is_fresh():
+                    async with session.get(
+                        f"{CLOB_HOST}/midpoint",
+                        params={"token_id": token_id},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as r:
+                        data = await r.json()
 
-                            # Pending token varsa dynamic subscribe yap
-                            if self._pending_token and self._pending_token != self.token_id:
-                                new_token = self._pending_token
-                                self._pending_token = None
-                                try:
-                                    # Yeni token'a abone ol
-                                    await ws.send(json.dumps({
-                                        "assets_ids": [new_token],
-                                        "operation":  "subscribe",
-                                        "custom_feature_enabled": True,
-                                    }))
-                                    # Eski token'dan çık
-                                    await ws.send(json.dumps({
-                                        "assets_ids": [self.token_id],
-                                        "operation":  "unsubscribe",
-                                    }))
-                                    old = self.token_id
-                                    self.token_id     = new_token
-                                    self._last_price  = None
-                                    print(f"[OddsStream] Dynamic switch: "
-                                          f"{old[:12]}... → {new_token[:12]}...")
-                                except Exception:
-                                    pass
-                            try:
-                                msg = json.loads(raw)
-                            except json.JSONDecodeError:
-                                continue
+                    mid = float(np.clip(float(data.get("mid", 0.5)), 0.01, 0.99))
 
-                            events = msg if isinstance(msg, list) else [msg]
-                            for event in events:
-                                etype = event.get("event_type")
+                    if self._last_mid is not None:
+                        delta = mid - self._last_mid
+                        odds_ref[0] = delta
+                        p_ref[0]    = float(np.clip(p_ref[0] + delta, 0.01, 0.99))
+                    else:
+                        p_ref[0] = mid
 
-                                if etype == "price_change":
-                                    for pc in event.get("price_changes", []):
-                                        if pc.get("asset_id") == self.token_id:
-                                            await self._handle_price(pc.get("price"))
-                                            bid = pc.get("best_bid")
-                                            ask = pc.get("best_ask")
-                                            if bid and ask and self.spread_callback:
-                                                try:
-                                                    self.spread_callback(
-                                                        float(bid), float(ask)
-                                                    )
-                                                except ValueError:
-                                                    pass
+                    self._last_mid = mid
+                    self._source   = "rest"
+                    print(f"[OddsHub] REST fallback: mid={mid:.3f}")
 
-                                elif etype == "best_bid_ask":
-                                    if event.get("asset_id") == self.token_id:
-                                        bid = event.get("best_bid")
-                                        ask = event.get("best_ask")
-                                        if bid and ask:
-                                            try:
-                                                b, a = float(bid), float(ask)
-                                                mid = (b + a) / 2
-                                                await self._handle_price(str(mid))
-                                                if self.spread_callback:
-                                                    self.spread_callback(b, a)
-                                            except ValueError:
-                                                pass
+                # Spread — her zaman REST'ten al (RTDS'te yok)
+                try:
+                    async with session.get(
+                        f"{CLOB_HOST}/spread",
+                        params={"token_id": token_id},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as r:
+                        sdata = await r.json()
 
-                                elif etype == "market_resolved":
-                                    # Pencere kapandı, kazanan token belli oldu
-                                    winning_asset   = event.get("winning_asset_id", "")
-                                    winning_outcome = event.get("winning_outcome", "")
-                                    slug            = event.get("slug", "")
-                                    if slug and winning_outcome:
-                                        outcome = "up" if winning_outcome.lower() in ("up", "yes") else "down"
-                                        ResolveFetcher.record_resolved(slug, outcome)
-                                    elif slug and winning_asset:
-                                        outcome = "up" if winning_asset == self.token_id else "down"
-                                        ResolveFetcher.record_resolved(slug, outcome)
-                    finally:
-                        ping_task.cancel()
-                        try:
-                            await ping_task
-                        except asyncio.CancelledError:
-                            pass
+                    bid = float(sdata.get("bid", 0) or 0)
+                    ask = float(sdata.get("ask", 1) or 1)
+                    if 0 < bid < ask < 1:
+                        spread_cache_fn(bid, ask)
+                except Exception:
+                    pass
 
-            except websockets.ConnectionClosed:
-                if self._running:
-                    print(f"[OddsStream] Koptu, {self.RECONNECT_DELAY}s sonra yeniden...")
-                    await asyncio.sleep(self.RECONNECT_DELAY)
-            except Exception as e:
-                if self._running:
-                    print(f"[OddsStream] Hata: {e}")
-                    await asyncio.sleep(self.RECONNECT_DELAY)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
-    async def _ping_loop(self, ws):
-        """Her 10s bağımsız olarak PING gönderir."""
-        try:
-            while True:
-                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
-                await ws.send("PING")
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
+        print("[OddsHub] Durduruldu")
 
-    async def _handle_price(self, price_str: str | None):
-        if not price_str:
-            return
-        try:
-            new_price = float(price_str)
-            if new_price <= 0:
-                return
-            if self._last_price is not None:
-                delta = new_price - self._last_price
-                await self.callback(delta)
-            self._last_price = new_price
-        except ValueError:
-            pass
+
+# Geriye dönük uyumluluk için alias
+RestOddsPoller = OddsHub
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1277,7 +1264,9 @@ class PriceFeed:
 
     # ── RTDS mesaj işleme ─────────────────────────────────
 
-    def _handle_rtds_message(self, raw: str, odds_ref: list, p_ref: list) -> None:
+    def _handle_rtds_message(
+        self, raw: str, odds_ref: list, p_ref: list, odds_hub=None,
+    ) -> None:
         try:
             msg   = json.loads(raw)
             topic = msg.get("topic", "")
@@ -1287,26 +1276,33 @@ class PriceFeed:
             payload = msg.get("payload", {})
 
             if topic == "crypto_prices_chainlink":
-                self._on_chainlink(payload, odds_ref, p_ref)
+                self._on_chainlink(payload, odds_ref, p_ref, odds_hub=odds_hub)
             elif topic == "crypto_prices":
                 self._on_binance_price(payload, odds_ref, p_ref)
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
 
-    def _on_chainlink(self, payload: dict, odds_ref: list, p_ref: list) -> None:
+    def _on_chainlink(
+        self, payload: dict, odds_ref: list, p_ref: list,
+        odds_hub=None,
+    ) -> None:
         if payload.get("symbol") != "btc/usd":
             return
         price = float(payload["value"])
         if price <= 0:
             return
 
-        was_fallback          = self._using_fallback
-        self._chainlink_price = price
+        was_fallback            = self._using_fallback
+        self._chainlink_price   = price
         self._chainlink_last_ts = time.time()
-        self._using_fallback  = False
+        self._using_fallback    = False
 
         if was_fallback:
             print(f"[PriceFeed] Chainlink geri döndü: ${price:,.2f}")
+
+        # OddsHub RTDS primary sinyali — fiyat değişimi → odds delta proxy
+        if odds_hub is not None:
+            odds_hub.on_rtds_price(price, odds_ref, p_ref)
 
         self._update_state(odds_ref, p_ref)
 
@@ -1365,32 +1361,29 @@ class PriceFeed:
 
     # ── Async run görevleri ────────────────────────────────
 
-    async def run_rtds(self, odds_ref: list, p_ref: list):
+    async def run_rtds(self, odds_ref: list, p_ref: list, odds_hub=None):
         """
         Polymarket RTDS: Chainlink + Binance fiyat tick'leri.
-        Her 5 saniyede PING gönderir (dokümantasyon zorunluluğu).
+        odds_hub: OddsHub referansı — Chainlink tick'lerini RTDS primary sinyali olarak iletir.
         """
         while True:
             try:
                 async with websockets.connect(
-                    WS_RTDS, ping_interval=None,   # manuel PING
+                    WS_RTDS, ping_interval=None,
                 ) as ws:
-                    # İki topic'e birden abone ol
                     await ws.send(json.dumps(_RTDS_SUB_CHAINLINK))
                     await ws.send(json.dumps(_RTDS_SUB_BINANCE_PRICE))
-                    print(f"[PriceFeed] RTDS bağlandı "
-                          f"(Chainlink primary + Binance fallback)")
+                    print("[PriceFeed] RTDS bağlandı (Chainlink primary + Binance fallback)")
 
                     last_ping = time.time()
                     async for raw in ws:
-                        self._handle_rtds_message(raw, odds_ref, p_ref)
-                        # Manuel PING
+                        self._handle_rtds_message(raw, odds_ref, p_ref, odds_hub=odds_hub)
                         if time.time() - last_ping >= self.PING_INTERVAL:
                             await ws.send("PING")
                             last_ping = time.time()
 
             except websockets.ConnectionClosed:
-                print("[PriceFeed] RTDS bağlantısı koptu, 3s sonra yeniden...")
+                print("[PriceFeed] RTDS koptu, 3s sonra yeniden...")
                 await asyncio.sleep(3)
             except Exception as e:
                 print(f"[PriceFeed] RTDS hata: {e}")
@@ -1479,33 +1472,26 @@ class DataHub:
     """
     Tüm veri kaynaklarını koordine eder.
 
-    FIX-6: Pencere geçişinde OddsStream eski token'ı bırakıp
-    yeni token'a bağlanıyor.
-
-    PriceFeed entegrasyonu:
-        - run_rtds(): Chainlink + Binance tick'leri (tek WS)
-        - run_kline(): Binance 5M mum verisi (ayrı WS)
-        - Yeni pencere açılınca set_window_open() çağrılır
+    Odds verisi artık WS (OddsStream) değil REST polling (RestOddsPoller) ile alınıyor.
+    Neden: CLOB WS "silent freeze" ve kopma sorunu çözümsüz.
+    REST /midpoint güvenilir, her zaman çalışıyor.
     """
 
     def __init__(self, vol_window: int = 20):
         self.market       = BTC5mMarket()
         self.price_feed   = PriceFeed(vol_window=vol_window)
         self.price_reader = PriceReader()
+        self.odds_poller  = RestOddsPoller()
 
         self._odds_delta  = [0.0]
         self._p_market    = [0.5]
         self._token_ids: dict | None = None
-        self._active_stream: OddsStream | None = None
-        self._active_token:  str | None = None
 
-        # best_bid_ask event'inden gelen son spread — REST çağrısını azaltır
+        # Spread cache — REST /spread'den dolduruluyor
         self._cached_spread: dict | None = None
 
     async def _refresh_market(self):
         window = self.market.get_current_window()
-        # slug parametresi geçmiyoruz — fetch_token_ids kendi içinde
-        # birden fazla candidate slug deniyor (saat farkı toleransı)
         ids = await self.market.fetch_token_ids()
         if ids:
             self._token_ids = ids
@@ -1514,80 +1500,20 @@ class DataHub:
             if ids["up_token_id"]:
                 mid = await self.price_reader.get_midpoint(ids["up_token_id"])
                 self._p_market[0] = mid
-            # Yeni pencere açıldı — eski spread cache'i sıfırla
-            self._cached_spread = None
-            # Chainlink fiyatını window_open_price olarak kilitle
+            # Yeni pencere → spread cache ve odds delta sıfırla
+            self._cached_spread  = None
+            self._odds_delta[0]  = 0.0
+            self.odds_poller.reset()
             self.price_feed.set_window_open()
         return ids
 
-    def _make_odds_callback(self):
-        odds_ref     = self._odds_delta
-        p_ref        = self._p_market
-        spread_cache = self  # DataHub referansı
-
-        async def on_odds(delta: float):
-            odds_ref[0] = delta
-            p_ref[0]    = max(0.01, min(0.99, p_ref[0] + delta))
-
-        return on_odds
-
     def cache_spread(self, bid: float, ask: float):
-        """OddsStream'den gelen best_bid_ask event'ini cache'ler.
-        OddsStream kopsa bile son bilinen değer korunur."""
         spread = max(ask - bid, 0.0)
-        # Sadece geçerli spread değerlerini cache'le (1.0 değil)
         if spread < 0.5:
             self._cached_spread = {"bid": bid, "ask": ask, "spread": spread}
 
     def get_cached_spread(self) -> dict | None:
         return self._cached_spread
-
-    async def _odds_stream_loop(self):
-        while True:
-            ids = self._token_ids
-            if not ids or not ids.get("up_token_id"):
-                await asyncio.sleep(2)
-                continue
-
-            token_id = ids["up_token_id"]
-
-            if not token_id or len(token_id) < 10:
-                print(f"[OddsStream] Geçersiz token ID: '{token_id}', bekleniyor...")
-                await asyncio.sleep(5)
-                continue
-
-            if self._active_token != token_id:
-                if self._active_stream is not None and self._active_stream._running:
-                    # Mevcut bağlantı açık — dynamic subscribe ile geç
-                    self._active_stream.update_token(token_id)
-                    self._active_token = token_id
-                    print(f"[OddsStream] Token güncellendi: {token_id[:20]}...")
-                    # run() devam ediyor, reconnect yok
-                    await asyncio.sleep(0.1)
-                    continue
-                else:
-                    # Bağlantı yok — yeni stream başlat
-                    if self._active_stream is not None:
-                        self._active_stream.stop()
-                    self._active_stream = OddsStream(
-                        token_id,
-                        self._make_odds_callback(),
-                        spread_callback=self.cache_spread,
-                    )
-                    self._active_token  = token_id
-                    print(f"[OddsStream] Yeni stream: {token_id[:20]}...")
-
-            try:
-                await self._active_stream.run()
-            except Exception as e:
-                print(f"[OddsStream] Loop hata: {e}")
-            finally:
-                # Kopunca odds_delta sıfırla
-                self._odds_delta[0] = 0.0
-                # Kopunca yeni pencere token ID'sini zorla al
-                # Sunucu pencere geçişinde eski token kanalını kapatıyor
-                asyncio.create_task(self._refresh_market())
-                await asyncio.sleep(1)
 
     async def _market_refresh_loop(self):
         while True:
@@ -1605,10 +1531,21 @@ class DataHub:
         return self.price_feed.active_source
 
     async def run(self):
+        # odds_hub her iki kaynağa da bağlı:
+        # RTDS → Chainlink tick'leri → on_rtds_price() (primary)
+        # REST → /midpoint polling → RTDS sessizse devreye girer (fallback)
+        hub = self.odds_poller   # OddsHub instance (alias: RestOddsPoller)
         await asyncio.gather(
-            self.price_feed.run_rtds(self._odds_delta, self._p_market),
+            self.price_feed.run_rtds(
+                self._odds_delta, self._p_market, odds_hub=hub
+            ),
             self.price_feed.run_kline(self._odds_delta, self._p_market),
-            self._odds_stream_loop(),
+            hub.run(
+                get_token_id=lambda: (self._token_ids or {}).get("up_token_id"),
+                odds_ref=self._odds_delta,
+                p_ref=self._p_market,
+                spread_cache_fn=self.cache_spread,
+            ),
             self._market_refresh_loop(),
         )
 
@@ -1721,6 +1658,7 @@ class Bot:
                 market_id=ids["up_token_id"],
                 state=state,
                 capital=self.wallet.balance,
+                odds_source=self.hub.odds_poller.active_source,
             )
 
             self._print_decision(decision, spread)
@@ -1762,6 +1700,7 @@ class Bot:
 
     def _print_decision(self, decision: dict, spread: dict):
         net_edge = (decision.get("edge") or 0) - spread["spread"]
+        src = decision.get("odds_source", "–")
         print("\n" + "═" * 56)
         print(f"  {time.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"  p_market       : {decision.get('p_market', 0):.3f}")
@@ -1771,6 +1710,7 @@ class Bot:
         print(f"  roi            : {decision.get('roi_pct', 0):+.2f}%")
         print(f"  exp. profit    : {decision.get('expected_profit', 0):+.2f} USDC")
         print(f"  spread         : {spread['spread']:.3f}")
+        print(f"  odds kaynak    : {src}")
         print(f"  net edge       : {net_edge:+.3f}  "
               f"({'OK' if net_edge > 0 else 'SPREAD AŞIYOR'})")
         print(f"  karar          : {decision['action'].upper()}")
