@@ -736,21 +736,50 @@ class ResolveFetcher:
         print(f"[Resolve] WS event'ten sonuç: {slug} → {outcome}")
 
     async def fetch_outcome(
-        self, slug: str, up_token_id: str, retries: int = 12,
+        self, slug: str, up_token_id: str, retries: int = 24,
+        window_open_price: float | None = None,
+        price_feed=None,
     ) -> Literal["up", "down"] | None:
+        """
+        Resolve yöntemleri (öncelik sırasıyla):
+        0. WS cache     — OddsStream market_resolved event'i
+        1. Chainlink    — window_open_price vs kapanış fiyatı (en güvenilir)
+        2. Gamma API    — winning_outcome alanı
+        3. CLOB midpoint — son çare
+        """
 
-        # Yöntem 0: WS cache'den anında bak
+        # Yöntem 0: WS cache
         if slug in self._resolve_cache:
             return self._resolve_cache[slug]
 
-        for attempt in range(retries):
-            await asyncio.sleep(5)
+        # Yöntem 1: Chainlink fiyat karşılaştırması
+        # Polymarket resolution: kapanış >= açılış → UP, aksi → DOWN
+        if window_open_price and price_feed:
+            await asyncio.sleep(3)   # Kısa bekleme — son fiyatın gelmesi için
+            close_price = price_feed._chainlink_price
+            if close_price and window_open_price:
+                outcome = "up" if close_price >= window_open_price else "down"
+                print(f"[Resolve] Chainlink → {outcome} "
+                      f"(open={window_open_price:.2f}, close={close_price:.2f})")
+                return outcome
 
-            # WS cache tekrar kontrol
+        for attempt in range(retries):
+            await asyncio.sleep(10)
+
+            # WS cache tekrar
             if slug in self._resolve_cache:
                 return self._resolve_cache[slug]
 
-            # Yöntem 1: Gamma API — resolved market'lerde winning_outcome dolar
+            # Chainlink tekrar dene (fiyat henüz güncellenmemiş olabilir)
+            if window_open_price and price_feed:
+                close_price = price_feed._chainlink_price
+                if close_price and abs(close_price - window_open_price) / window_open_price > 0.0001:
+                    outcome = "up" if close_price >= window_open_price else "down"
+                    print(f"[Resolve] Chainlink (gecikmeli) → {outcome} "
+                          f"(open={window_open_price:.2f}, close={close_price:.2f})")
+                    return outcome
+
+            # Gamma API
             try:
                 session = await SessionManager.get()
                 async with session.get(
@@ -764,17 +793,16 @@ class ResolveFetcher:
                 winner = market.get("winning_outcome", "")
                 if winner:
                     outcome = "up" if winner.lower() in ("up", "yes", "1") else "down"
-                    print(f"[Resolve] Gamma API sonucu: {slug} → {outcome} (winner={winner})")
+                    print(f"[Resolve] Gamma API → {outcome} (winner='{winner}')")
                     return outcome
 
-                # closed=True ama winner yok → biraz daha bekle
-                if market.get("closed") or market.get("resolved"):
-                    print(f"[Resolve] Market kapalı, winner bekleniyor ({attempt+1}/{retries})")
+                if market.get("resolved"):
+                    print(f"[Resolve] Market resolved ama winner yok ({attempt+1}/{retries})")
 
-            except Exception as e:
-                pass  # sessizce geç, CLOB'u dene
+            except Exception:
+                pass
 
-            # Yöntem 2: CLOB midpoint
+            # CLOB midpoint
             try:
                 session = await SessionManager.get()
                 async with session.get(
@@ -783,18 +811,17 @@ class ResolveFetcher:
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
                     data = await r.json()
-
                 mid = float(data.get("mid", 0.5))
                 if mid >= 0.95:
                     return "up"
                 if mid <= 0.05:
                     return "down"
-                print(f"[Resolve] Bekleniyor mid={mid:.3f} ({attempt+1}/{retries})")
-
+                if attempt % 3 == 0:
+                    print(f"[Resolve] mid={mid:.3f} bekleniyor ({attempt+1}/{retries})")
             except Exception as e:
                 print(f"[Resolve] Hata ({attempt+1}/{retries}): {e}")
 
-        print(f"[Resolve] {slug} sonucu {retries} denemede alınamadı.")
+        print(f"[Resolve] {slug} sonucu alınamadı.")
         return None
 
 
@@ -1019,10 +1046,20 @@ class OddsStream:
         self.callback        = callback
         self.spread_callback = spread_callback
         self._last_price: float | None = None
-        self._running    = True
+        self._running        = True
+        self._pending_token: str | None = None   # dynamic subscribe için
 
     def stop(self):
         self._running = False
+
+    def update_token(self, new_token_id: str):
+        """
+        Pencere geçişinde WS'i kesmeden yeni token'a abone ol.
+        Polymarket dynamic subscribe destekliyor:
+        {"assets_ids": ["new_id"], "operation": "subscribe"}
+        {"assets_ids": ["old_id"], "operation": "unsubscribe"}
+        """
+        self._pending_token = new_token_id
 
     async def run(self):
         while self._running:
@@ -1046,6 +1083,30 @@ class OddsStream:
                         async for raw in ws:
                             if not self._running:
                                 return
+
+                            # Pending token varsa dynamic subscribe yap
+                            if self._pending_token and self._pending_token != self.token_id:
+                                new_token = self._pending_token
+                                self._pending_token = None
+                                try:
+                                    # Yeni token'a abone ol
+                                    await ws.send(json.dumps({
+                                        "assets_ids": [new_token],
+                                        "operation":  "subscribe",
+                                        "custom_feature_enabled": True,
+                                    }))
+                                    # Eski token'dan çık
+                                    await ws.send(json.dumps({
+                                        "assets_ids": [self.token_id],
+                                        "operation":  "unsubscribe",
+                                    }))
+                                    old = self.token_id
+                                    self.token_id     = new_token
+                                    self._last_price  = None
+                                    print(f"[OddsStream] Dynamic switch: "
+                                          f"{old[:12]}... → {new_token[:12]}...")
+                                except Exception:
+                                    pass
                             try:
                                 msg = json.loads(raw)
                             except json.JSONDecodeError:
@@ -1490,32 +1551,43 @@ class DataHub:
 
             token_id = ids["up_token_id"]
 
-            # Token ID geçerli mi? Boş string veya köşeli parantez değil
             if not token_id or len(token_id) < 10:
                 print(f"[OddsStream] Geçersiz token ID: '{token_id}', bekleniyor...")
                 await asyncio.sleep(5)
                 continue
 
             if self._active_token != token_id:
-                if self._active_stream is not None:
-                    self._active_stream.stop()
-                    print("[OddsStream] Eski stream durduruldu.")
-                self._active_stream = OddsStream(
-                    token_id,
-                    self._make_odds_callback(),
-                    spread_callback=self.cache_spread,   # spread cache bağlantısı
-                )
-                self._active_token  = token_id
-                print(f"[OddsStream] Yeni stream: {token_id[:20]}...")
+                if self._active_stream is not None and self._active_stream._running:
+                    # Mevcut bağlantı açık — dynamic subscribe ile geç
+                    self._active_stream.update_token(token_id)
+                    self._active_token = token_id
+                    print(f"[OddsStream] Token güncellendi: {token_id[:20]}...")
+                    # run() devam ediyor, reconnect yok
+                    await asyncio.sleep(0.1)
+                    continue
+                else:
+                    # Bağlantı yok — yeni stream başlat
+                    if self._active_stream is not None:
+                        self._active_stream.stop()
+                    self._active_stream = OddsStream(
+                        token_id,
+                        self._make_odds_callback(),
+                        spread_callback=self.cache_spread,
+                    )
+                    self._active_token  = token_id
+                    print(f"[OddsStream] Yeni stream: {token_id[:20]}...")
+
             try:
                 await self._active_stream.run()
             except Exception as e:
                 print(f"[OddsStream] Loop hata: {e}")
-                await asyncio.sleep(1)
             finally:
-                # OddsStream kopunca odds_delta'yı sıfırla
-                # Stale değer Bayesian modeli yanlış yönlendirmesin
+                # Kopunca odds_delta sıfırla
                 self._odds_delta[0] = 0.0
+                # Kopunca yeni pencere token ID'sini zorla al
+                # Sunucu pencere geçişinde eski token kanalını kapatıyor
+                asyncio.create_task(self._refresh_market())
+                await asyncio.sleep(1)
 
     async def _market_refresh_loop(self):
         while True:
@@ -1599,13 +1671,20 @@ class Bot:
         if wait > 0:
             await asyncio.sleep(wait + 2)
 
-        outcome = await self.resolver.fetch_outcome(trade.slug, trade.up_token_id)
+        # Chainlink window_open_price'ı geç — en güvenilir resolve yöntemi
+        window_open_price = self.hub.price_feed.window_open_price
+        price_feed        = self.hub.price_feed
+
+        outcome = await self.resolver.fetch_outcome(
+            trade.slug, trade.up_token_id,
+            window_open_price=window_open_price,
+            price_feed=price_feed,
+        )
 
         if outcome is None:
             self.wallet.refund(trade)
         else:
             self.wallet.resolve(trade, outcome)
-            # EK-5: Temporal prior'ı gerçek sonuçla güncelle
             self._temporal.record(outcome)
 
         self.engine.register_close(trade.up_token_id)
