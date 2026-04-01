@@ -1444,6 +1444,10 @@ class DataHub:
             except Exception as e:
                 print(f"[OddsStream] Loop hata: {e}")
                 await asyncio.sleep(1)
+            finally:
+                # OddsStream kopunca odds_delta'yı sıfırla
+                # Stale değer Bayesian modeli yanlış yönlendirmesin
+                self._odds_delta[0] = 0.0
 
     async def _market_refresh_loop(self):
         while True:
