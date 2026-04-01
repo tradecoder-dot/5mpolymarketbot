@@ -717,11 +717,64 @@ class PaperWallet:
 # ══════════════════════════════════════════════════════════════
 
 class ResolveFetcher:
+    """
+    Pencere kapandıktan sonra sonucu belirler.
+
+    Yöntem 1: Gamma API — market kapatıldıktan sonra 'winning_outcome' alanı dolar
+    Yöntem 2: CLOB midpoint — kazanan token ≥0.95 veya ≤0.05
+
+    NOT: market_resolved WS event'i OddsStream üzerinden yakalanıyor,
+         oradan gelen sonuç _resolve_cache'e yazılıyor.
+    """
+
+    _resolve_cache: dict[str, str] = {}   # slug → "up"|"down"
+
+    @classmethod
+    def record_resolved(cls, slug: str, outcome: str):
+        """OddsStream market_resolved event'inden çağrılır."""
+        cls._resolve_cache[slug] = outcome
+        print(f"[Resolve] WS event'ten sonuç: {slug} → {outcome}")
+
     async def fetch_outcome(
         self, slug: str, up_token_id: str, retries: int = 12,
     ) -> Literal["up", "down"] | None:
+
+        # Yöntem 0: WS cache'den anında bak
+        if slug in self._resolve_cache:
+            return self._resolve_cache[slug]
+
         for attempt in range(retries):
             await asyncio.sleep(5)
+
+            # WS cache tekrar kontrol
+            if slug in self._resolve_cache:
+                return self._resolve_cache[slug]
+
+            # Yöntem 1: Gamma API — resolved market'lerde winning_outcome dolar
+            try:
+                session = await SessionManager.get()
+                async with session.get(
+                    f"{GAMMA_HOST}/markets",
+                    params={"slug": slug},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as r:
+                    data = await r.json()
+
+                market = data[0] if isinstance(data, list) and data else {}
+                winner = market.get("winning_outcome", "")
+                if winner:
+                    outcome = "up" if winner.lower() in ("up", "yes", "1") else "down"
+                    print(f"[Resolve] Gamma API sonucu: {slug} → {outcome} (winner={winner})")
+                    return outcome
+
+                # closed=True ama winner yok → biraz daha bekle
+                if market.get("closed") or market.get("resolved"):
+                    print(f"[Resolve] Market kapalı, winner bekleniyor ({attempt+1}/{retries})")
+
+            except Exception as e:
+                pass  # sessizce geç, CLOB'u dene
+
+            # Yöntem 2: CLOB midpoint
             try:
                 session = await SessionManager.get()
                 async with session.get(
@@ -730,15 +783,18 @@ class ResolveFetcher:
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as r:
                     data = await r.json()
+
                 mid = float(data.get("mid", 0.5))
                 if mid >= 0.95:
                     return "up"
                 if mid <= 0.05:
                     return "down"
                 print(f"[Resolve] Bekleniyor mid={mid:.3f} ({attempt+1}/{retries})")
+
             except Exception as e:
                 print(f"[Resolve] Hata ({attempt+1}/{retries}): {e}")
-        print(f"[Resolve] {slug} sonucu alınamadı.")
+
+        print(f"[Resolve] {slug} sonucu {retries} denemede alınamadı.")
         return None
 
 
@@ -1026,6 +1082,18 @@ class OddsStream:
                                                     self.spread_callback(b, a)
                                             except ValueError:
                                                 pass
+
+                                elif etype == "market_resolved":
+                                    # Pencere kapandı, kazanan token belli oldu
+                                    winning_asset   = event.get("winning_asset_id", "")
+                                    winning_outcome = event.get("winning_outcome", "")
+                                    slug            = event.get("slug", "")
+                                    if slug and winning_outcome:
+                                        outcome = "up" if winning_outcome.lower() in ("up", "yes") else "down"
+                                        ResolveFetcher.record_resolved(slug, outcome)
+                                    elif slug and winning_asset:
+                                        outcome = "up" if winning_asset == self.token_id else "down"
+                                        ResolveFetcher.record_resolved(slug, outcome)
                     finally:
                         ping_task.cancel()
                         try:
