@@ -766,16 +766,21 @@ class ResolveFetcher:
         if slug in self._resolve_cache:
             return self._resolve_cache[slug]
 
-        # Yöntem 1: Chainlink fiyat karşılaştırması
-        # Polymarket resolution: kapanış >= açılış → UP, aksi → DOWN
+        # Yöntem 1: Chainlink karşılaştırması
+        # Polymarket: kapanış >= açılış → UP, aksi → DOWN
+        # Pencere kapanınca yeni Chainlink tick'ini bekle (max 15s)
         if window_open_price and price_feed:
-            await asyncio.sleep(3)   # Kısa bekleme — son fiyatın gelmesi için
-            close_price = price_feed._chainlink_price
-            if close_price and window_open_price:
-                outcome = "up" if close_price >= window_open_price else "down"
-                print(f"[Resolve] Chainlink → {outcome} "
-                      f"(open={window_open_price:.2f}, close={close_price:.2f})")
-                return outcome
+            ts_before = price_feed._chainlink_last_ts
+            for wait_i in range(5):   # 5 × 3s = 15s max
+                await asyncio.sleep(3)
+                close_price = price_feed._chainlink_price
+                tick_is_new = price_feed._chainlink_last_ts > ts_before
+                if close_price and (tick_is_new or wait_i >= 2):
+                    outcome = "up" if close_price >= window_open_price else "down"
+                    label = "yeni tick" if tick_is_new else "son bilinen"
+                    print(f"[Resolve] Chainlink ({label}) → {outcome} "
+                          f"(open={window_open_price:.2f}, close={close_price:.2f})")
+                    return outcome
 
         for attempt in range(retries):
             await asyncio.sleep(10)
@@ -1257,10 +1262,25 @@ class PriceFeed:
             return self._chainlink_price
         return self._binance_price
 
-    def set_window_open(self):
-        """Yeni 5M pencere açılınca çağrılır — Chainlink fiyatını kilitler."""
+    def set_window_open(self, window_ts: float | None = None):
+        """
+        Yeni 5M pencere açılınca çağrılır.
+
+        window_ts: pencere başlangıç unix timestamp'i (opsiyonel)
+        Chainlink tick timestamp'i kaydedilir — resolve'da referans olarak kullanılır.
+
+        NOT: Polymarket tam window_ts anındaki Chainlink değerini kullanıyor.
+        Bizim son tick'imiz pencere başından en fazla max_chainlink_age saniye önce
+        gelebilir. Bu kabul edilebilir — büyük fiyat hareketlerinde fark yaratmaz,
+        çok küçük hareketlerde (< $5) resolve belirsizliği zaten kaçınılmaz.
+        """
         if self._chainlink_price is not None:
             self._window_open_price = self._chainlink_price
+            lag = time.time() - self._chainlink_last_ts
+            if lag > 5:
+                print(f"[PriceFeed] window_open_price: "
+                      f"${self._chainlink_price:,.2f} "
+                      f"(son Chainlink tick {lag:.0f}s önce)")
 
     # ── RTDS mesaj işleme ─────────────────────────────────
 
