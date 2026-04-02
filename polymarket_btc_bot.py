@@ -1072,7 +1072,7 @@ class OddsHub:
     """
 
     POLL_INTERVAL = 10    # REST fallback polling aralığı (saniye)
-    RTDS_TIMEOUT  = 15    # RTDS bu kadar sessiz kalırsa REST devreye girer
+    RTDS_TIMEOUT  = 25    # Chainlink tick aralığı 10-30s → 25s timeout optimal
 
     def __init__(self):
         self._last_mid:         float | None = None
