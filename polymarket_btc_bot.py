@@ -530,7 +530,7 @@ class DecisionEngine:
         state:       MarketState,
         capital:     float,
         direction:   int = 1,
-        odds_source: str = "rtds",   # "rtds" | "rest" | "none"
+        odds_source: str = "none",   # hub.odds_poller.active_source'dan gelir
     ) -> dict:
         p_true = self.updater.update(state, direction)
 
@@ -1072,20 +1072,30 @@ class OddsHub:
         self._last_rtds_price:  float | None = None
         self._last_rtds_ts:     float        = 0.0
         self._running  = True
-        self._source   = "none"   # "rtds" | "rest" | "none"
 
     def stop(self):
         self._running = False
 
     def reset(self):
-        """Yeni pencere başlayınca delta sıfırla."""
+        """Yeni pencere başlayınca delta sıfırla — source sıfırlanmaz."""
         self._last_mid        = None
         self._last_rtds_price = None
-        self._last_rtds_ts    = 0.0
+        # _last_rtds_ts sıfırlanmıyor: freshness kontrolü için korunur
+        # _source sıfırlanmıyor: pencere boyunca en iyi kaynak takip edilir
 
     @property
     def active_source(self) -> str:
-        return self._source
+        """
+        Karar anındaki odds veri kaynağı:
+          - RTDS son RTDS_TIMEOUT içinde tick geldiyse → "rtds"
+          - REST fallback en son çalıştıysa → "rest"
+          - Hiç veri yoksa → "none"
+        """
+        if self._rtds_is_fresh():
+            return "rtds"
+        if self._last_mid is not None:
+            return "rest"
+        return "none"
 
     def on_rtds_price(
         self,
@@ -1095,18 +1105,20 @@ class OddsHub:
     ) -> None:
         """
         PriceFeed'den her Chainlink tick'inde çağrılır.
-        Fiyat değişim hızını odds_delta proxy'si olarak kullanır.
+
+        Değişiklik: delta proxy yerine tick varlığı yeterli sinyal.
+        Fiyat değişimi odds_delta'yı günceller, küçük harekette bile
+        "rtds" kaynağı aktif sayılır çünkü anlık piyasa bilgisi var.
         """
         now = time.time()
+
         if self._last_rtds_price is not None:
-            # Fiyat değişimi oranı → odds delta proxy
-            # BTC +%0.1 → UP token ~+0.02 (ampirik katsayı 0.2)
             pct_change = (chainlink_price - self._last_rtds_price) / self._last_rtds_price
-            delta = float(np.clip(pct_change * 0.2, -0.05, 0.05))
-            if abs(delta) > 0.0001:   # ~%0.05 BTC hareketi eşiği
-                odds_ref[0] = delta
-                p_ref[0]    = float(np.clip(p_ref[0] + delta, 0.01, 0.99))
-                self._source = "rtds"
+            # Katsayı 0.2 → 0.5: daha güçlü sinyal
+            # Filtre 0.0001 → kaldırıldı: her tick sinyal üretir
+            delta = float(np.clip(pct_change * 0.5, -0.05, 0.05))
+            odds_ref[0] = delta
+            p_ref[0]    = float(np.clip(p_ref[0] + delta, 0.01, 0.99))
 
         self._last_rtds_price = chainlink_price
         self._last_rtds_ts    = now
@@ -1158,7 +1170,6 @@ class OddsHub:
                         p_ref[0] = mid
 
                     self._last_mid = mid
-                    self._source   = "rest"
                     print(f"[OddsHub] REST fallback: mid={mid:.3f}")
 
                 # Spread — her zaman REST'ten al (RTDS'te yok)
