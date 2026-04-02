@@ -742,12 +742,19 @@ class ResolveFetcher:
     """
 
     _resolve_cache: dict[str, str] = {}   # slug → "up"|"down"
+    _MAX_CACHE     = 100                   # Bu kadar slug sonrası eski yarısını sil
 
     @classmethod
     def record_resolved(cls, slug: str, outcome: str):
         """OddsStream market_resolved event'inden çağrılır."""
         cls._resolve_cache[slug] = outcome
         print(f"[Resolve] WS event'ten sonuç: {slug} → {outcome}")
+        # Cache büyüme kontrolü — 100 slug geçince en eski %50'yi sil
+        if len(cls._resolve_cache) > cls._MAX_CACHE:
+            to_remove = list(cls._resolve_cache.keys())[:cls._MAX_CACHE // 2]
+            for k in to_remove:
+                del cls._resolve_cache[k]
+            print(f"[Resolve] Cache temizlendi: {len(to_remove)} eski slug silindi")
 
     async def fetch_outcome(
         self, slug: str, up_token_id: str, retries: int = 24,
@@ -1562,10 +1569,7 @@ class DataHub:
         return self.price_feed.active_source
 
     async def run(self):
-        # odds_hub her iki kaynağa da bağlı:
-        # RTDS → Chainlink tick'leri → on_rtds_price() (primary)
-        # REST → /midpoint polling → RTDS sessizse devreye girer (fallback)
-        hub = self.odds_poller   # OddsHub instance (alias: RestOddsPoller)
+        hub = self.odds_poller
         await asyncio.gather(
             self.price_feed.run_rtds(
                 self._odds_delta, self._p_market, odds_hub=hub
@@ -1578,6 +1582,7 @@ class DataHub:
                 spread_cache_fn=self.cache_spread,
             ),
             self._market_refresh_loop(),
+            return_exceptions=True,
         )
 
 
