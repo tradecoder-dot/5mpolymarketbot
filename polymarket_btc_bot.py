@@ -1330,11 +1330,15 @@ class PriceFeed:
         if price <= 0:
             return
 
+        now                     = time.time()
+        tick_interval           = now - self._chainlink_last_ts if self._chainlink_last_ts > 0 else 0
         was_fallback            = self._using_fallback
         self._chainlink_price   = price
-        self._chainlink_last_ts = time.time()
+        self._chainlink_last_ts = now
         self._using_fallback    = False
 
+        if tick_interval > 25:
+            print(f"[RTDS] Uzun sessizlik: {tick_interval:.0f}s → ${price:,.2f}")
         if was_fallback:
             print(f"[PriceFeed] Chainlink geri döndü: ${price:,.2f}")
 
