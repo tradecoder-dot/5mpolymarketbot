@@ -1084,11 +1084,14 @@ class OddsHub:
         self._running = False
 
     def reset(self):
-        """Yeni pencere başlayınca delta sıfırla — source sıfırlanmaz."""
+        """
+        Yeni pencere başlayınca sıfırla.
+        _last_rtds_ts da sıfırlanıyor — active_source sorusu
+        bu pencerede tick geldi mi? olmalı, son Xs'de değil.
+        """
         self._last_mid        = None
         self._last_rtds_price = None
-        # _last_rtds_ts sıfırlanmıyor: freshness kontrolü için korunur
-        # _source sıfırlanmıyor: pencere boyunca en iyi kaynak takip edilir
+        self._last_rtds_ts    = 0.0
 
     @property
     def active_source(self) -> str:
