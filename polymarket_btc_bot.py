@@ -1101,7 +1101,7 @@ class OddsHub:
           - REST fallback en son çalıştıysa → "rest"
           - Hiç veri yoksa → "none"
         """
-        if self._rtds_is_fresh():
+        if self._last_rtds_ts > 0:
             return "rtds"
         if self._last_mid is not None:
             return "rest"
