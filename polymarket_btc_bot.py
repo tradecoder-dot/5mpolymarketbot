@@ -1092,6 +1092,7 @@ class OddsHub:
         self._last_mid        = None
         self._last_rtds_price = None
         self._last_rtds_ts    = 0.0
+        print(f"[OddsHub] reset — yeni pencere, _last_rtds_ts=0")
 
     @property
     def active_source(self) -> str:
@@ -1102,10 +1103,13 @@ class OddsHub:
           - Hiç veri yoksa → "none"
         """
         if self._last_rtds_ts > 0:
-            return "rtds"
-        if self._last_mid is not None:
-            return "rest"
-        return "none"
+            src = "rtds"
+        elif self._last_mid is not None:
+            src = "rest"
+        else:
+            src = "none"
+        print(f"[OddsHub] active_source → {src} (_last_rtds_ts={self._last_rtds_ts:.0f})")
+        return src
 
     def on_rtds_price(
         self,
@@ -1132,6 +1136,7 @@ class OddsHub:
 
         self._last_rtds_price = chainlink_price
         self._last_rtds_ts    = now
+        print(f"[OddsHub] tick → _last_rtds_ts güncellendi ({now:.0f})")
 
     def _rtds_is_fresh(self) -> bool:
         return (time.time() - self._last_rtds_ts) < self.RTDS_TIMEOUT
