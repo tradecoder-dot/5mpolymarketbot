@@ -536,7 +536,8 @@ class DecisionEngine:
 
         if market_id in self.open_positions:
             return {"action": "hold", "reason": "açık pozisyon var",
-                    "p_true": p_true, "p_market": state.p_market}
+                    "p_true": p_true, "p_market": state.p_market,
+                    "odds_source": odds_source}
 
         # Odds kaynağına göre dinamik min_edge
         original_min_edge = self.sizer.min_edge
@@ -550,7 +551,8 @@ class DecisionEngine:
 
         if outcome is None:
             return {"action": "hold", "reason": "edge yetersiz",
-                    "p_true": p_true, "p_market": state.p_market}
+                    "p_true": p_true, "p_market": state.p_market,
+                    "odds_source": odds_source}
 
         result, side = outcome
         ev_fields = _compute_ev_fields(p_true, state.p_market, result.position_usdc, side=side)
