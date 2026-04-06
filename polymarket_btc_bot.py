@@ -114,6 +114,10 @@ class PaperTrade:
     usdc_spent:  float
     p_true:      float
     edge:        float
+    p_market:    float = 0.0
+    odds_source: str   = "none"
+    net_edge:    float = 0.0
+    f_kelly:     float = 0.0
     result:      Literal["win", "loss", "pending"] = "pending"
     payout:      float = 0.0
     pnl:         float = 0.0
@@ -616,6 +620,10 @@ class PaperWallet:
         usdc_amount: float,
         p_true:      float,
         edge:        float,
+        p_market:    float = 0.0,
+        odds_source: str   = "none",
+        net_edge:    float = 0.0,
+        f_kelly:     float = 0.0,
     ) -> PaperTrade | None:
         if usdc_amount <= 0:
             return None
@@ -637,6 +645,8 @@ class PaperWallet:
             slug=slug, direction=direction, up_token_id=up_token_id,
             entry_price=entry_price, shares=shares,
             usdc_spent=usdc_amount, p_true=p_true, edge=edge,
+            p_market=p_market, odds_source=odds_source,
+            net_edge=net_edge, f_kelly=f_kelly,
         )
         self._trades.append(trade)
 
@@ -718,7 +728,8 @@ class PaperWallet:
         if not self._trades:
             return
         fields = ["trade_id", "ts_open", "ts_close", "slug", "direction",
-                  "entry_price", "shares", "usdc_spent", "p_true", "edge",
+                  "entry_price", "shares", "usdc_spent", "p_true", "p_market",
+                  "edge", "net_edge", "f_kelly", "odds_source",
                   "result", "payout", "pnl"]
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields)
@@ -1728,10 +1739,14 @@ class Bot:
                             slug=window["slug"],
                             direction=side,
                             up_token_id=ids["up_token_id"],
-                            entry_price=limit_price,   # ← limit fiyat (EK-4)
+                            entry_price=limit_price,
                             usdc_amount=decision["usdc"],
                             p_true=decision["p_true"],
                             edge=decision["edge"],
+                            p_market=decision.get("p_market", 0.0),
+                            odds_source=decision.get("odds_source", "none"),
+                            net_edge=decision["edge"] - spread["spread"],
+                            f_kelly=decision.get("f_kelly", 0.0),
                         )
                         if trade:
                             self.engine.register_open(ids["up_token_id"])
