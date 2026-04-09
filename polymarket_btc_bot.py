@@ -1830,6 +1830,19 @@ class Bot:
         print(f"║   Başlangıç: {self.wallet.starting_capital:>10,.2f} USDC               ║")
         print("╚════════════════════════════════════════════╝\n")
 
+        # CSV DUMP — başlangıçta mevcut log dosyasını log'a yaz
+        if os.path.exists(self.log_path):
+            try:
+                with open(self.log_path, "r", encoding="utf-8") as _f:
+                    _csv = _f.read()
+                print("[CSV_DUMP_START]")
+                print(_csv)
+                print("[CSV_DUMP_END]")
+            except Exception as _e:
+                print(f"[CSV_DUMP] Hata: {_e}")
+        else:
+            print("[CSV_DUMP] Dosya bulunamadı:", self.log_path)
+
         try:
             await asyncio.gather(
                 self.hub.run(),
