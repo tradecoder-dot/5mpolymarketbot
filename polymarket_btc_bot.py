@@ -1682,6 +1682,11 @@ class Bot:
 
         self.engine.register_close(trade.up_token_id)
         self._print_wallet_status()
+        # Her resolve sonrası CSV'yi diske yaz — SIGKILL'e karşı koruma
+        try:
+            self.wallet.save_log(self.log_path)
+        except Exception as _e:
+            print(f"[Bot] CSV yazma hatası: {_e}")
 
     # ── karar döngüsü ─────────────────────────────────────────
 
