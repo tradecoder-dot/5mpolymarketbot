@@ -272,7 +272,7 @@ class BayesianUpdater:
     Kalibre edilecek katsayılar:
         price_signal_strength : 0.3
         volume_weight         : 0.1   | clip (-0.5, 0.5)
-        odds_multiplier       : 5.0   | clip (-1.0, 1.0)
+        odds_multiplier       : 2.0   | clip (-1.0, 1.0)
         temporal_weight       : 0.20  (EK-5)
         vol_window            : 20 mum (BinanceFeed'de)
     """
@@ -282,7 +282,7 @@ class BayesianUpdater:
         price_signal_strength: float = 0.3,
         volume_weight:         float = 0.1,
         volume_clip:           float = 0.5,
-        odds_multiplier:       float = 5.0,
+        odds_multiplier:       float = 2.0,
         odds_clip:             float = 1.0,
         temporal_weight:       float = 0.20,   # kalibre edilecek (EK-5)
         corrector:  MispricingCorrector | None = None,
@@ -364,18 +364,18 @@ class KellySizer:
     Döndürür: (KellyResult, "up") | (KellyResult, "down") | None
 
     Kalibre edilecek katsayılar:
-        fraction         : 0.25
-        max_position_pct : 0.10
+        fraction         : 0.15
+        max_position_pct : 0.05
         min_edge         : 0.03
         min_confidence   : 0.55
     """
 
     def __init__(
         self,
-        fraction:         float = 0.25,
-        max_position_pct: float = 0.10,
-        min_edge:         float = 0.03,
-        min_confidence:   float = 0.55,
+        fraction:         float = 0.15,
+        max_position_pct: float = 0.05,
+        min_edge:         float = 0.07,
+        min_confidence:   float = 0.57,
     ):
         self.fraction         = fraction
         self.max_position_pct = max_position_pct
@@ -1139,7 +1139,7 @@ class OddsHub:
             pct_change = (chainlink_price - self._last_rtds_price) / self._last_rtds_price
             # Katsayı 0.2 → 0.5: daha güçlü sinyal
             # Filtre 0.0001 → kaldırıldı: her tick sinyal üretir
-            delta = float(np.clip(pct_change * 0.5, -0.05, 0.05))
+            delta = float(np.clip(pct_change * 0.3, -0.05, 0.05))
             odds_ref[0] = delta
             p_ref[0]    = float(np.clip(p_ref[0] + delta, 0.01, 0.99))
 
@@ -1644,8 +1644,8 @@ class Bot:
                 temporal=temporal,
             ),
             sizer=KellySizer(
-                fraction=0.25, max_position_pct=0.10,
-                min_edge=0.03, min_confidence=0.55,
+                fraction=0.15, max_position_pct=0.05,
+                min_edge=0.07, min_confidence=0.57,
             ),
         )
 
@@ -1835,18 +1835,14 @@ class Bot:
         print(f"║   Başlangıç: {self.wallet.starting_capital:>10,.2f} USDC               ║")
         print("╚════════════════════════════════════════════╝\n")
 
-        # CSV DUMP — başlangıçta mevcut log dosyasını log'a yaz
-        if os.path.exists(self.log_path):
-            try:
-                with open(self.log_path, "r", encoding="utf-8") as _f:
-                    _csv = _f.read()
-                print("[CSV_DUMP_START]")
-                print(_csv)
-                print("[CSV_DUMP_END]")
-            except Exception as _e:
-                print(f"[CSV_DUMP] Hata: {_e}")
-        else:
-            print("[CSV_DUMP] Dosya bulunamadı:", self.log_path)
+        # Kalibrasyon sonrası temiz başlangıç — eski CSV verisini sil
+        try:
+            import os as _os
+            if _os.path.exists(self.log_path):
+                _os.remove(self.log_path)
+                print(f"[Bot] CSV temizlendi: {self.log_path}")
+        except Exception as _e:
+            print(f"[Bot] CSV temizleme hatası: {_e}")
 
         try:
             await asyncio.gather(
